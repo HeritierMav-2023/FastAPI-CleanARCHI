@@ -2,8 +2,8 @@ class DomainError(Exception):
     """Base class for domain errors."""
     message = "Erreur metier"
 
-def __init__(self, message: str | None = None):
-    super().__init__(message or self.message)
+    def __init__(self, message: str | None = None):
+        super().__init__(message or self.message)
 
 class EmailAlreadyUsed(DomainError):
     message = "L'email est déjà utilisé"
@@ -21,3 +21,6 @@ class TaskNotFound(DomainError):
 
 class UnauthorizedAccess(DomainError):
     message = "Accès non autorisé"
+
+class PermissionDenied(DomainError):
+    message = "Permission refusée"

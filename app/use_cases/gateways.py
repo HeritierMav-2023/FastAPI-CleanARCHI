@@ -40,10 +40,13 @@ class RefreshTokenRepository(ABC):
     def add(self, refresh_token: RefreshToken) -> RefreshToken | None:...
 
     @abstractmethod
-    def get_by_id(self, token_id: UUID) -> RefreshToken | None:...
+    def get(self, token_id: UUID) -> RefreshToken | None:...
 
     @abstractmethod
-    def delete(self, token_id: UUID) -> bool:...
+    def revoke(self, token_id: UUID) -> None:...
+
+    @abstractmethod
+    def revoke_all_for_user(self, user_id: UUID) -> None:...
 
 
 #-----------------Gateways de  securite-----------------
@@ -60,7 +63,7 @@ class PasswordHasher(ABC):
 
 #2- classe autorisant la gestion des tokens JWT pour l'authentification et l'autorisation.
 @dataclass(frozen=True)
-class AuthToken:
+class TokenPair:
     access_token: str
     refresh_token: str
 

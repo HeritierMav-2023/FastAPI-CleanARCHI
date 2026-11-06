@@ -23,8 +23,9 @@ class Actor:
 @dataclass
 class User:
     """Représente un utilisateur dans le système."""
-    id: UUID = field(default_factory=uuid4)
     email: str
+    hashed_password: str
+    id: UUID = field(default_factory=uuid4)
     role: Role = Role.USER
     is_active: bool = True
 
@@ -53,6 +54,7 @@ class RefreshToken:
     id: UUID 
     user_id: UUID
     expires_at: datetime
+    revoked: bool = False
 
 
     

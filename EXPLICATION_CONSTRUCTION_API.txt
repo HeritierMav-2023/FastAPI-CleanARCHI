@@ -1,0 +1,393 @@
+GUIDE DE CONSTRUCTION DE L'API, ETAPE PAR ETAPE
+================================================
+
+Ce document explique comment les principales pieces de cette API FastAPI
+s'assemblent et quels imports sont utilises. Il complete
+EXPLICATION_SOLUTION.txt, qui porte sur la correction du depot des jetons.
+
+Le projet separe les regles metier des details techniques :
+
+    main.py
+      -> app/main.py : creation de FastAPI et branchement des routeurs
+        -> framework/web/routers/ : routes HTTP
+          -> framework/web/dependencies.py : assemblage des dependances
+            -> app/use_cases/ : actions de l'application
+              -> app/use_cases/gateways.py : contrats abstraits
+                -> app/interface_adapters/ : implementations concretes
+                  -> SQLAlchemy, Argon2 et JWT
+
+
+ETAPE 0 - Installer et configurer le projet
+-------------------------------------------
+
+Les dependances Python sont listees dans requirements.txt. Elles comprennent
+notamment FastAPI, Uvicorn, Pydantic, SQLAlchemy, Alembic, PyJWT et Argon2.
+Le fichier docker-compose.yml declare le service PostgreSQL.
+
+Le module framework/config.py utilise Pydantic Settings :
+
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_file=".env")
+        database_url: str
+        jwt_secret_key: str
+
+Il faut fournir database_url et jwt_secret_key dans l'environnement ou dans
+un fichier .env local. Ce fichier ne doit pas contenir de secrets publies
+dans le depot. Les autres parametres incluent l'algorithme JWT, la duree des
+jetons, les cookies et les origines CORS.
+
+Depuis la racine du depot, les commandes de demarrage usuelles sont :
+
+    pip install -r requirements.txt
+    docker compose up -d db
+    alembic upgrade head
+    uvicorn main:app --reload
+
+Alembic lit aussi framework.config.settings. La migration presente dans
+alembic/versions/ cree les tables users, tasks et refresh_tokens.
+
+Imports principaux de configuration et de base de donnees :
+
+    # framework/config.py
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    # framework/db/session.py
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as _Session, sessionmaker as _sessionmaker
+    from framework.config import settings
+
+    # alembic/env.py
+    from app.interface_adapters.gateways.db.models import Base
+    from framework.config import settings
+
+Les imports commencant par sqlalchemy, pydantic_settings, fastapi, etc. sont
+des dependances externes. Ceux commencant par app. ou framework. sont des
+modules du projet.
+
+
+ETAPE 1 - Definir le domaine
+----------------------------
+
+Fichier : app/entities/entities.py
+
+Le domaine contient les objets principaux sans dependance a FastAPI ou a
+SQLAlchemy : Role, Actor, User, Task et RefreshToken.
+
+Imports de ce fichier :
+
+    from dataclasses import dataclass, field
+    from datetime import datetime, timezone
+    from enum import Enum
+    from uuid import UUID, uuid4
+
+Exemples de responsabilites :
+
+- Role definit les valeurs admin et user.
+- User porte l'identite, le mot de passe hache et le role.
+- Task represente une tache et son proprietaire.
+- RefreshToken represente l'identifiant et l'etat de revocation d'un jeton.
+
+Les erreurs metier sont declarees a part dans
+app/entities/exceptions.py. Ce fichier n'a pas d'import externe : il definit
+DomainError et ses variantes, comme InvalidToken, TaskNotFound et
+PermissionDenied.
+
+
+ETAPE 2 - Decrire les contrats attendus
+---------------------------------------
+
+Fichier : app/use_cases/gateways.py
+
+Les gateways sont des interfaces abstraites. Elles indiquent ce dont les cas
+d'usage ont besoin sans les lier a une base ou a un fournisseur de jetons.
+
+Imports :
+
+    from abc import ABC, abstractmethod
+    from uuid import UUID
+    from dataclasses import dataclass
+    from datetime import datetime
+    from app.entities.entities import Actor, RefreshToken, Task, User
+
+Les contrats comprennent notamment UserRepository, TaskRepository,
+RefreshTokenRepository, PasswordHasher et TokenService. TokenPair et
+RefreshClaims sont des dataclasses partagees entre les cas d'usage et les
+adaptateurs.
+
+
+ETAPE 3 - Creer les modeles et les depots de base de donnees
+------------------------------------------------------------
+
+Fichier des modeles : app/interface_adapters/gateways/db/models.py
+
+Imports principaux :
+
+    from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, Uuid
+    from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
+
+Base est la classe declarative SQLAlchemy. UserModel, TaskModel et
+RefreshTokenModel decrivent les tables stockees.
+
+Fichier des depots : app/interface_adapters/gateways/db/repositories.py
+
+Imports :
+
+    from uuid import UUID
+    from sqlalchemy.orm import Session
+    from sqlalchemy import select, update, delete
+    from app.use_cases.gateways import (
+        TaskRepository, RefreshTokenRepository, UserRepository
+    )
+    from app.interface_adapters.gateways.db.models import (
+        TaskModel, RefreshTokenModel, UserModel
+    )
+    from app.entities.entities import Task, RefreshToken, User, Role
+
+Les SqlAlchemy...Repository implementent les contrats de l'etape precedente.
+Ils traduisent les objets du domaine en modeles SQLAlchemy et inversement.
+La session est creee par framework/db/session.py puis injectee pour la
+duree d'une requete.
+
+
+ETAPE 4 - Ajouter les adaptateurs de securite
+---------------------------------------------
+
+Hachage des mots de passe : app/interface_adapters/gateways/security/password.py
+
+    from argon2 import PasswordHasher as _Argon2
+    from argon2.exceptions import VerifyMismatchError, InvalidHashError
+    from app.use_cases.gateways import PasswordHasher
+
+Argon2PasswordHasher implemente le contrat PasswordHasher : il hache les
+mots de passe a l'enregistrement et les verifie a la connexion.
+
+Jetons : app/interface_adapters/gateways/security/jwt_service.py
+
+    from datetime import datetime, timedelta, timezone
+    from uuid import UUID, uuid4
+    import jwt
+    from app.use_cases.gateways import RefreshClaims, TokenService
+    from app.entities.entities import Actor, Role, User
+    from app.entities.exceptions import InvalidToken
+
+JWtTokenService cree et decode les jetons d'acces et de rafraichissement.
+Il implemente le contrat TokenService et utilise les parametres de
+framework.config.settings, assembles dans framework/web/dependencies.py.
+
+
+ETAPE 5 - Ecrire les cas d'usage
+-------------------------------
+
+Authentification : app/use_cases/auth.py
+
+    from app.use_cases.gateways import (
+        PasswordHasher, RefreshTokenRepository, UserRepository,
+        TokenService, TokenPair
+    )
+    from app.entities.entities import User, RefreshToken
+    from app.entities.exceptions import (
+        EmailAlreadyUsed, InvalidCredentials, InvalidToken
+    )
+
+Les classes RegisterUser, LoginUser, RefreshSession et LogoutUser
+orchestrent les operations metier en utilisant uniquement les contrats.
+Elles ne recoivent pas directement d'objet Request FastAPI ou de session
+SQLAlchemy.
+
+Taches : app/use_cases/tasks.py
+
+    from uuid import UUID
+    from app.entities.entities import Actor, Task
+    from app.entities.exceptions import TaskNotFound, PermissionDenied
+    from app.use_cases.gateways import TaskRepository
+
+Les classes CreateTask, ListMyTasks, ListAllTasks, GetTask, UpdateTask et
+DeleteTask utilisent TaskRepository et appliquent les controles d'acces et
+les regles metier.
+
+
+ETAPE 6 - Definir les formats HTTP
+----------------------------------
+
+Fichier : app/interface_adapters/schemas.py
+
+    from datetime import datetime
+    from uuid import UUID
+    from pydantic import BaseModel, Field, EmailStr, ConfigDict
+    from app.entities.entities import Role
+
+Les schemas Pydantic valident les entrees (RegisterRequest, LoginRequest,
+TaskCreate, TaskUpdate) et definissent les sorties (UserResponse,
+TaskResponse). Ils permettent a FastAPI de valider les donnees et de produire
+la documentation OpenAPI.
+
+
+ETAPE 7 - Assembler les implementations avec l'injection de dependances
+-----------------------------------------------------------------------
+
+Fichier : framework/web/dependencies.py
+
+Imports principaux :
+
+    from typing import Annotated
+    from fastapi import Cookie, Depends, HTTPException
+    from sqlalchemy.orm import Session as SQLAlchemySession
+    from app.use_cases.gateways import (
+        RefreshTokenRepository, TaskRepository, TokenService, UserRepository
+    )
+    from app.use_cases.auth import LoginUser, LogoutUser, RefreshSession, RegisterUser
+    from app.use_cases.tasks import (
+        CreateTask, DeleteTask, ListMyTasks, ListAllTasks, GetTask, UpdateTask
+    )
+    from framework.config import settings
+    from app.entities.entities import Actor, Role
+    from app.entities.exceptions import InvalidToken
+    from app.interface_adapters.gateways.db.repositories import (
+        SqlAlchemyRefreshTokenRepository, SqlAlchemyTaskRepository,
+        SqlAlchemyUserRepository
+    )
+    from framework.db.session import get_session
+    from app.interface_adapters.gateways.security.jwt_service import JWtTokenService
+    from app.interface_adapters.gateways.security.password import Argon2PasswordHasher
+
+Ce module est le point de composition : il construit les repositories autour
+de la session de la requete, puis les passe aux cas d'usage. Il fournit aussi
+les fonctions de lecture du cookie d'acces et de verification de role avec
+Depends(...).
+
+
+ETAPE 8 - Exposer les routes HTTP
+---------------------------------
+
+Authentification : framework/web/routers/auth.py
+
+Imports principaux :
+
+    from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
+    from app.use_cases.auth import RegisterUser, LoginUser, LogoutUser, RefreshSession
+    from app.entities.entities import Actor
+    from app.entities.exceptions import InvalidToken
+    from framework.web.cookies import clear_auth_cookies, set_auth_cookies
+    from framework.web.dependencies import (
+        get_current_actor, get_login_user, get_logout_user,
+        get_refresh_session, get_register_user, get_user_repo
+    )
+    from app.interface_adapters.schemas import LoginRequest, RegisterRequest, UserResponse
+
+Le routeur a le prefixe /auth. Les operations declarees sont :
+
+- POST /auth/register : cree un compte ;
+- POST /auth/login : authentifie et pose les cookies de session ;
+- POST /auth/refresh : renouvelle la paire de jetons ;
+- POST /auth/logout : revoque le jeton et retire les cookies ;
+- GET /auth/me : renvoie l'utilisateur authentifie.
+
+Taches : framework/web/routers/tasks.py
+
+Imports principaux :
+
+    from uuid import UUID
+    from fastapi import APIRouter, Depends
+    from app.entities.entities import Actor, Role
+    from framework.web.dependencies import (
+        get_create_task, get_delete_task, get_list_my_tasks,
+        get_list_all_tasks, get_get_task, get_update_task,
+        get_current_actor, require_role
+    )
+    from app.interface_adapters.schemas import TaskCreate, TaskResponse, TaskUpdate
+
+Le routeur a le prefixe /tasks. Les declarations couvrent creation,
+consultation, liste personnelle, mise a jour et suppression. La route de
+liste complete est reservee au role admin.
+
+
+ETAPE 9 - Construire l'application et traduire les erreurs
+----------------------------------------------------------
+
+Fichier : app/main.py
+
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from framework.config import settings
+    from framework.web.error_handlers import register_error_handlers
+    from framework.web.routers.auth import router as auth_router
+    from framework.web.routers.tasks import router as tasks_router
+
+Ce module cree l'objet FastAPI, configure CORS, enregistre les gestionnaires
+d'erreurs et inclut les deux routeurs. La racine main.py expose cet objet
+pour Uvicorn :
+
+    from app.main import app
+
+framework/web/error_handlers.py associe les exceptions de domaine a des
+reponses HTTP. framework/web/cookies.py centralise la creation et la
+suppression des cookies d'authentification.
+
+
+ETAPE 10 - Suivre une requete de bout en bout
+---------------------------------------------
+
+Exemple : connexion de l'utilisateur
+
+    POST /auth/login
+      -> auth.py valide LoginRequest
+      -> Depends(get_login_user) construit LoginUser et ses dependances
+      -> LoginUser verifie le compte et le mot de passe via les contrats
+      -> UserRepository lit l'utilisateur en base
+      -> PasswordHasher verifie le hash Argon2
+      -> TokenService cree les jetons JWT
+      -> RefreshTokenRepository enregistre le jeton de rafraichissement
+      -> cookies.py place les jetons dans la reponse HTTP
+
+Exemple : creation d'une tache
+
+    POST /tasks/
+      -> tasks.py valide TaskCreate et recupere Actor depuis le cookie
+      -> Depends(get_create_task) construit CreateTask avec son repository
+      -> CreateTask construit une entite Task avec l'identifiant du proprietaire
+      -> SqlAlchemyTaskRepository enregistre TaskModel
+      -> TaskResponse structure la reponse
+
+
+IMPORTS : COMMENT LES LIRE
+--------------------------
+
+- from fastapi ... : composants HTTP, routeurs, dependances et reponses.
+- from pydantic ... : validation et schemas des donnees.
+- from sqlalchemy ... : session, requetes et modeles de base de donnees.
+- from app.entities ... : objets et erreurs metier.
+- from app.use_cases ... : actions de l'application et contrats abstraits.
+- from app.interface_adapters ... : implementations techniques et schemas.
+- from framework ... : configuration, session DB, routes et dependances web.
+
+Les imports internes utilisent les noms de modules depuis la racine du projet.
+Par exemple, app.entities.entities correspond au fichier
+app/entities/entities.py.
+
+
+POINTS A HARMONISER DANS LE CODE ACTUEL
+--------------------------------------
+
+Les points suivants sont releves dans les fichiers source au moment de la
+redaction. Ils sont listes pour distinguer l'architecture visee du
+comportement effectivement implemente ; ce document ne modifie pas le code.
+
+1. Dans framework/web/routers/tasks.py, le prefixe /tasks est combine avec
+   le chemin "admin/all" sans slash initial : le chemin assemble est
+   /tasksadmin/all, et non /tasks/admin/all.
+2. La route admin appelle use_case.execute() sans argument, alors que
+   ListAllTasks.execute dans app/use_cases/tasks.py attend actor.
+3. La route PATCH transmet title, description et is_completed comme
+   arguments separes, alors que UpdateTask.execute attend un dictionnaire
+   changes.
+4. _get_authorized_task appelle task.is_accessible_by(actor), mais
+   is_accessible_by est actuellement une fonction au niveau du module dans
+   app/entities/entities.py, pas une methode de la classe Task.
+5. RegisterUser utilise user_repo.add(...), mais la methode add n'est pas
+   declaree dans le contrat UserRepository de app/use_cases/gateways.py,
+   meme si SqlAlchemyUserRepository la fournit.
+
+Ces incoherences doivent etre corrigees dans le code avant de presenter les
+routes concernees comme entierement operationnelles.

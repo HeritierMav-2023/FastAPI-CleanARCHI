@@ -1,6 +1,6 @@
 from app.use_cases.gateways import (PasswordHasher, RefreshTokenRepository, UserRepository, TokenService, TokenPair)
 from app.entities.entities import User, RefreshToken
-from  app.entities.exceptions import EmailAlreadyExistsError, EmailAlreadyUsed, InvalidCredentials, InvalidCredentialsError, InvalidToken, UserNotFoundError
+from app.entities.exceptions import EmailAlreadyUsed, InvalidCredentials, InvalidToken
 
 
 #-----------------Use Cases d'authentification-----------------

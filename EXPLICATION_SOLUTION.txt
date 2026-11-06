@@ -1,0 +1,148 @@
+EXPLICATION DE LA CORRECTION DU DEPOT DE JETONS DE RAFRAICHISSEMENT
+===================================================================
+
+Objectif
+--------
+Corriger l'erreur :
+
+    TypeError: Can't instantiate abstract class
+    SqlAlchemyRefreshTokenRepository without an implementation for
+    abstract methods 'delete', 'get_by_id'
+
+Cette erreur se produisait parce que le contrat abstrait du dépôt et son
+implémentation SQLAlchemy n'exposaient pas les mêmes méthodes. Python refuse
+d'instancier une classe qui hérite d'une classe abstraite si certaines de ses
+méthodes abstraites ne sont pas implémentées.
+
+
+Architecture du projet
+----------------------
+Le projet suit une organisation inspirée de la Clean Architecture. Les
+responsabilités sont réparties entre le domaine, les cas d'usage, les
+adaptateurs et le framework :
+
+    main.py
+      Point d'entree ASGI utilise par Uvicorn.
+        |
+        v
+    app/main.py
+      Cree l'application FastAPI et enregistre les routeurs.
+        |
+        v
+    framework/web/routers/
+      Recoit les requetes HTTP et appelle les cas d'usage.
+        |
+        v
+    framework/web/dependencies.py
+      Assemble les dependances : cas d'usage, depots, session DB et services.
+        |
+        +----------------------------+
+        |                            |
+        v                            v
+    app/use_cases/auth.py       app/interface_adapters/gateways/
+      Regles du parcours           db/repositories.py
+      d'authentification.          Persistance SQLAlchemy.
+        |                            |
+        v                            v
+    app/use_cases/gateways.py    app/interface_adapters/gateways/db/models.py
+      Contrats abstraits des        Modeles et tables SQLAlchemy.
+      depots et services.
+        |
+        v
+    app/entities/
+      Objets et regles du domaine, dont l'entite RefreshToken.
+
+Le sens important de cette architecture est que le cas d'usage depend du
+contrat abstrait RefreshTokenRepository, pas directement de SQLAlchemy. Le
+depot concret SqlAlchemyRefreshTokenRepository implemente ce contrat dans
+l'adaptateur de persistance. Le framework relie les deux au moment de
+construire la dependance web.
+
+Chemin d'une requete de rafraichissement :
+
+    requete HTTP /auth/refresh
+      -> routeur framework/web/routers/auth.py
+      -> dependances dans framework/web/dependencies.py
+      -> cas d'usage RefreshSession dans app/use_cases/auth.py
+      -> contrat RefreshTokenRepository dans app/use_cases/gateways.py
+      -> implementation SQLAlchemy dans repositories.py
+      -> table refresh_tokens via SQLAlchemy
+
+Lors d'une connexion, LoginUser suit la meme chaine pour verifier
+l'utilisateur et enregistrer le nouveau jeton de rafraichissement.
+
+
+1. Le contrat du dépôt décrit les opérations attendues
+-------------------------------------------------------
+Fichier : app/use_cases/gateways.py
+
+RefreshTokenRepository définit les opérations nécessaires au cycle de vie
+d'un jeton :
+
+- add : enregistrer un jeton de rafraîchissement ;
+- get : retrouver un jeton par son identifiant ;
+- revoke : révoquer un jeton précis ;
+- revoke_all_for_user : révoquer tous les jetons d'un utilisateur.
+
+Ces méthodes correspondent aux usages du cas d'usage d'authentification.
+Le contrat déclarait auparavant get_by_id et delete, tandis que le reste
+du code utilisait get et revoke. Ce désaccord produisait l'erreur
+d'instanciation.
+
+
+2. Le dépôt SQLAlchemy implémente chaque opération
+--------------------------------------------------
+Fichier : app/interface_adapters/gateways/db/repositories.py
+
+SqlAlchemyRefreshTokenRepository hérite de RefreshTokenRepository et fournit
+maintenant les méthodes attendues :
+
+- add construit le modèle SQLAlchemy, l'ajoute à la session et valide la
+  transaction ;
+- get recherche le modèle par identifiant, puis le convertit en entité ;
+- revoke passe le champ revoked à True pour un seul jeton ;
+- revoke_all_for_user passe ce champ à True pour tous les jetons d'un
+  utilisateur.
+
+La révocation est une mise à jour, pas une suppression : conserver les lignes
+permet de détecter la réutilisation d'un jeton précédemment révoqué.
+
+
+3. L'état de révocation est transporté dans l'entité
+----------------------------------------------------
+Fichier : app/entities/entities.py
+
+RefreshToken possède maintenant un champ revoked, dont la valeur par défaut
+est False. Le dépôt SQLAlchemy copie cette valeur dans les deux sens entre
+l'entité métier et le modèle de base de données.
+
+Le cas d'usage RefreshSession peut ainsi rejeter un jeton révoqué et,
+lorsqu'une réutilisation est détectée, révoquer également les autres jetons
+de l'utilisateur.
+
+
+4. Le parcours de connexion et de rafraîchissement
+--------------------------------------------------
+Fichier : app/use_cases/auth.py
+
+Lorsqu'une connexion réussit, le cas d'usage crée une paire de jetons. Il
+enregistre l'identifiant du jeton de rafraîchissement avec l'utilisateur et
+sa date d'expiration.
+
+Lors d'un rafraîchissement, le cas d'usage lit le jeton avec get, vérifie
+qu'il existe et n'est pas révoqué, révoque le jeton consommé, puis crée une
+nouvelle paire. Lors d'une déconnexion, le jeton correspondant est révoqué.
+
+
+5. Vérification
+---------------
+La correction a été vérifiée en important le contrat et le dépôt, puis en
+instanciant SqlAlchemyRefreshTokenRepository. L'instanciation réussit et
+Python confirme l'implémentation des quatre méthodes abstraites :
+
+    add, get, revoke, revoke_all_for_user
+
+Ce contrôle valide la cohérence du contrat de classes. Il ne teste pas
+l'accès à une base PostgreSQL réelle ; les identifiants, les droits et la
+connexion à la base doivent être vérifiés séparément dans l'environnement
+d'exécution.
